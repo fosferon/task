@@ -6,8 +6,6 @@ on:
     paths-ignore:
       - '.github/workflows/test.yml'
       - 'examples/**'
-      - '**/*.test.ts'
-      - 'test/**'
 
 concurrency:
   group: ci-${{ github.ref }}
