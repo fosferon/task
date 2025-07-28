@@ -2,6 +2,9 @@ import type { ResponseInput } from '@just-every/ensemble';
 import type { MetamemoryState } from '../metamemory/index.js';
 
 export interface CognitionState {
+    /** Whether cognition is enabled for this task */
+    enabled?: boolean;
+
     /** Meta-cognition frequency for this task */
     frequency?: number;
 
@@ -16,10 +19,16 @@ export interface CognitionState {
 
     /** Whether cognition is currently processing */
     processing?: boolean;
+    
+    /** Timestamp when processing started (for detecting stuck states) */
+    lastProcessingStartTime?: number;
 }
 
 // JSON-serializable version of CognitionState for events
 export interface SerializedCognitionState {
+    /** Whether cognition is enabled for this task */
+    enabled?: boolean;
+
     /** Meta-cognition frequency for this task */
     frequency?: number;
 
@@ -34,6 +43,9 @@ export interface SerializedCognitionState {
 
     /** Whether cognition is currently processing */
     processing?: boolean;
+    
+    /** Timestamp when processing started (for detecting stuck states) */
+    lastProcessingStartTime?: number;
 }
 
 /**
@@ -63,5 +75,8 @@ export interface TaskLocalState {
 
         /** Whether memory is currently processing */
         processing?: boolean;
+        
+        /** Timestamp when processing started (for detecting stuck states) */
+        lastProcessingStartTime?: number;
     }
 }

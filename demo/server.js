@@ -52,6 +52,7 @@ wss.on('connection', (ws, req) => {
   const isResume = url.searchParams.get('resume') === 'true';
   const metaFrequency = url.searchParams.get('metaFrequency');
   const metamemoryEnabled = url.searchParams.get('metamemoryEnabled') !== 'false';
+  const runIndefinitely = url.searchParams.get('runIndefinitely') === 'true';
 
   const { logger, disconnect } = enableRequestDemoLogger(ws, setEnsembleLogger);
 
@@ -99,7 +100,8 @@ wss.on('connection', (ws, req) => {
   (async () => {
     const options = {
       ...(metaFrequency && { metaFrequency: parseInt(metaFrequency) }),
-      ...(metamemoryEnabled !== undefined && { metamemoryEnabled })
+      ...(metamemoryEnabled !== undefined && { metamemoryEnabled }),
+      ...(runIndefinitely !== undefined && { runIndefinitely })
     };
 
     if (isResume && pendingState) {

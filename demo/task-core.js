@@ -183,11 +183,17 @@ export function createDemoTools(send = null) {
   ];
 }
 
-function createDemoAgent(send = null) {
+function createDemoAgent(send = null, isConversationMode = false) {
+  const baseInstructions = `You are a helpful AI assistant demonstrating the Task framework. You have access to various tools for web search, file operations, data analysis, planning, and more. Use these tools as needed. Be detailed in your work and use multiple tools when appropriate.\n\nYour knowledge cut off is from a past date. Today's date is ${new Date().toLocaleDateString()}.`;
+  
+  const instructions = isConversationMode 
+    ? baseInstructions + '\n\nYou are in conversation mode. Respond naturally to the user without using task_complete unless explicitly asked to end the conversation.'
+    : baseInstructions + ' When you have fully completed the task, use the task_complete tool with a comprehensive summary.';
+  
   return new Agent({
     name: 'TaskDemoAgent',
     modelClass: 'standard',
-    instructions: `You are a helpful AI assistant demonstrating the Task framework. You have access to various tools for web search, file operations, data analysis, planning, and more. Use these tools as needed to complete the task thoroughly. Be detailed in your work and use multiple tools when appropriate. When you have fully completed the task, use the task_complete tool with a comprehensive summary.\n\nYour knowledge cut off is from a past date. Today's date is ${new Date().toLocaleDateString()}.`,
+    instructions,
     tools: createDemoTools(send)
   });
 }
@@ -196,7 +202,7 @@ export function startDemoTask(prompt, send, options = {}) {
   const controller = new AbortController();
   (async () => {
     try {
-        const agent = createDemoAgent(send);
+        const agent = createDemoAgent(send, options.runIndefinitely);
 
         // Convert options to taskLocalState format
         const taskLocalState = {
@@ -205,7 +211,8 @@ export function startDemoTask(prompt, send, options = {}) {
             },
             memory: {
                 enabled: options.metamemoryEnabled !== false
-            }
+            },
+            runIndefinitely: options.runIndefinitely || false
         };
 
         // Use resumeTask if we have a finalState, otherwise use runTask

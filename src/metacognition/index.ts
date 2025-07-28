@@ -114,7 +114,7 @@ function getMetaCognitionTools(mainMessages: ResponseInput, taskLocalState: Task
                 frequency: {
                     type: 'string',
                     description: 'Frequency value (5, 10, 20, or 40 LLM requests)',
-                    enum: VALID_FREQUENCIES as unknown as string[],
+                    enum: VALID_FREQUENCIES.map(f => f.toString()),
                 },
             },
             undefined,
@@ -206,7 +206,15 @@ export async function spawnMetaThought(
     startTime: Date,
     taskRequestCount: number,
     taskLocalState: TaskLocalState
-): Promise<{ adjustments?: string[], injectedThoughts?: string[] }> {
+): Promise<{ 
+    adjustments?: string[], 
+    injectedThoughts?: string[],
+    toolCalls?: Array<{
+        name: string;
+        arguments: any;
+        summary: string;
+    }>
+}> {
     // Validate inputs
     if (!parent || typeof parent !== 'object') {
         throw new TypeError('[Task] Invalid agent for metacognition');
@@ -226,6 +234,7 @@ export async function spawnMetaThought(
         // Create a metacognition agent
         const metaAgent = new Agent({
             name: 'MetaCognitionAnalyzer',
+            tags: ['background', 'cognition'],
             parent_id: parent.agent_id,
             instructions: `Your role is to perform **Metacognition** for the agent named **${parent.name || 'Unknown'}**.
 
@@ -252,7 +261,6 @@ Analyze the agent's recent thoughts and:
 Be concise and strategic in your analysis.`,
             tools: [...getMetaCognitionTools(messages, taskLocalState)],
             modelClass: 'reasoning',
-            tags: ['background', 'cognition'],
             modelSettings: {
                 tool_choice: 'required'
             },
@@ -298,6 +306,11 @@ Be concise and strategic in your analysis.`,
         // Track adjustments made
         const adjustments: string[] = [];
         const injectedThoughts: string[] = [];
+        const toolCalls: Array<{
+            name: string;
+            arguments: any;
+            summary: string;
+        }> = [];
 
         // Run metacognition request - ensemble will handle model selection with modelClass
         for await (const event of ensembleRequest(metaMessages, metaAgent)) {
@@ -313,45 +326,76 @@ Be concise and strategic in your analysis.`,
 
                 switch (toolName) {
                     case 'inject_thought':
-                        adjustments.push(`Injected thought`);
                         const injectArgs = args as any;
                         if (injectArgs?.content) {
                             injectedThoughts.push(injectArgs?.content);
+                            adjustments.push(`Injected thought`);
+                            toolCalls.push({
+                                name: 'inject_thought',
+                                arguments: injectArgs,
+                                summary: `Injected thought: "${injectArgs.content.substring(0, 100)}${injectArgs.content.length > 100 ? '...' : ''}"`
+                            });
                         }
                         break;
                     case 'set_meta_frequency':
                         const freqArgs = args as any;
-                        if (freqArgs?.frequency) {
+                        if (freqArgs?.frequency !== undefined) {
                             adjustments.push(`Changed meta frequency to ${freqArgs.frequency}`);
+                            toolCalls.push({
+                                name: 'set_meta_frequency',
+                                arguments: freqArgs,
+                                summary: `Changed meta frequency to ${freqArgs.frequency}`
+                            });
                         }
                         break;
                     case 'set_thought_delay':
                         const delayArgs = args as any;
-                        if (delayArgs?.seconds) {
-                            adjustments.push(`Changed thought delay to ${delayArgs.seconds}s`);
+                        if (delayArgs?.delay !== undefined) {
+                            adjustments.push(`Changed thought delay to ${delayArgs.delay}s`);
+                            toolCalls.push({
+                                name: 'set_thought_delay',
+                                arguments: delayArgs,
+                                summary: `Changed thought delay to ${delayArgs.delay}s`
+                            });
                         }
                         break;
                     case 'disable_model':
                         const disableArgs = args as any;
-                        if (disableArgs?.model_id) {
-                            adjustments.push(`Disabled model ${disableArgs.model_id}`);
+                        if (disableArgs?.modelId) {
+                            const action = disableArgs.disabled === false ? 'Enabled' : 'Disabled';
+                            adjustments.push(`${action} model ${disableArgs.modelId}`);
+                            toolCalls.push({
+                                name: 'disable_model',
+                                arguments: disableArgs,
+                                summary: `${action} model ${disableArgs.modelId}`
+                            });
                         }
                         break;
-                    case 'adjust_model_score':
+                    case 'set_model_score':
                         const scoreArgs = args as any;
-                        if (scoreArgs?.model_id && scoreArgs?.score) {
-                            adjustments.push(`Adjusted ${scoreArgs.model_id} score to ${scoreArgs.score}`);
+                        if (scoreArgs?.modelId && scoreArgs?.score !== undefined) {
+                            adjustments.push(`Adjusted ${scoreArgs.modelId} score to ${scoreArgs.score}`);
+                            toolCalls.push({
+                                name: 'set_model_score',
+                                arguments: scoreArgs,
+                                summary: `Adjusted ${scoreArgs.modelId} score to ${scoreArgs.score}`
+                            });
                         }
                         break;
                     case 'no_changes_needed':
                         // No changes made!
+                        toolCalls.push({
+                            name: 'no_changes_needed',
+                            arguments: {},
+                            summary: 'No changes needed'
+                        });
                         break;
                 }
             }
         }
 
         console.log('[Task] Metacognition process completed', adjustments);
-        return { adjustments, injectedThoughts };
+        return { adjustments, injectedThoughts, toolCalls };
     } catch (error) {
         console.error('[Task] Error in metacognition:', error);
         throw error;

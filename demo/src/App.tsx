@@ -24,7 +24,8 @@ function App() {
   const [activeTab, setActiveTab] = useState<TabType>('conversation')
   const [taskSettings, setTaskSettings] = useState({
     metaFrequency: '5',
-    metamemoryEnabled: true
+    metamemoryEnabled: true,
+    runIndefinitely: false
   })
 
   const [, setIsConnected] = useState(false)
@@ -48,6 +49,7 @@ function App() {
         prompt: prompt,
         ...(settings?.metaFrequency && { metaFrequency: settings.metaFrequency }),
         ...(settings?.metamemoryEnabled !== undefined && { metamemoryEnabled: String(settings.metamemoryEnabled) }),
+        ...(settings?.runIndefinitely !== undefined && { runIndefinitely: String(settings.runIndefinitely) }),
         // Add flag to indicate if we're resuming
         resume: String(taskState.messages.length > 0)
       });
@@ -83,7 +85,8 @@ function App() {
               enabled: settings?.metamemoryEnabled !== false,
               state: taskState.memoryData.currentState,
               processing: false
-            }
+            },
+            runIndefinitely: settings?.runIndefinitely || false
           };
 
           console.log('Sending resume state with memory:', {

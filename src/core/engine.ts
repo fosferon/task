@@ -32,6 +32,22 @@ const activeTaskMessages = new WeakMap<AsyncGenerator<TaskStreamEvent>, Response
 // Map to track cleanup functions for generators
 const generatorCleanup = new WeakMap<AsyncGenerator<TaskStreamEvent>, () => void>();
 
+// Timer management interfaces
+interface MetaProcessingTimers {
+    memoryTimer: NodeJS.Timeout | null;
+    cognitionTimer: NodeJS.Timeout | null;
+    memoryDebounceTimer: NodeJS.Timeout | null;
+    cognitionDebounceTimer: NodeJS.Timeout | null;
+}
+
+interface MetaProcessingState {
+    unprocessedMemoryMessages: ResponseInput;
+    unprocessedCognitionMessages: ResponseInput;
+    lastMemoryProcessTime: number;
+    lastCognitionProcessTime: number;
+    messagesSinceLastCognition: number;
+}
+
 /**
  * Get Task control tools
  */
@@ -71,6 +87,269 @@ function getTaskTools(): ToolFunction[] {
             'task_fatal_error'
         )
     ];
+}
+
+/**
+ * Process meta memory with timer-based triggering
+ */
+async function processMetaMemory(
+    metamemory: Metamemory | undefined,
+    messages: ResponseInput,
+    metaState: MetaProcessingState,
+    taskLocalState: TaskLocalState,
+    asyncEventQueue: (MetaMemoryEvent | MetaCognitionEvent)[],
+    pendingAsyncOps: Set<Promise<void>>,
+    abortSignal?: AbortSignal
+): Promise<void> {
+    if (!metamemory || !taskLocalState.memory?.enabled) {
+        return;
+    }
+    
+    // Check if processing is stuck
+    if (taskLocalState.memory?.processing) {
+        const STUCK_THRESHOLD = 2 * 60 * 1000; // 2 minutes
+        const processingTime = taskLocalState.memory.lastProcessingStartTime 
+            ? Date.now() - taskLocalState.memory.lastProcessingStartTime 
+            : 0;
+            
+        if (processingTime > STUCK_THRESHOLD) {
+            console.warn(`[Task] Meta memory processing appears stuck (running for ${Math.round(processingTime / 1000)}s), forcibly resetting`);
+            taskLocalState.memory.processing = false;
+            taskLocalState.memory.lastProcessingStartTime = undefined;
+        } else {
+            return; // Still processing within reasonable time
+        }
+    }
+
+    const unprocessedMessages = metaState.unprocessedMemoryMessages;
+    if (unprocessedMessages.length === 0) {
+        return;
+    }
+
+    console.log(`[Task] Processing ${unprocessedMessages.length} messages for meta memory`);
+
+    // Clear the unprocessed messages
+    metaState.unprocessedMemoryMessages = [];
+    metaState.lastMemoryProcessTime = Date.now();
+
+    // Emit metamemory tagging started event
+    const startEventData: any = {
+        messageCount: messages.length,
+        unprocessedCount: unprocessedMessages.length
+    };
+
+    if (taskLocalState.memory.state) {
+        // Convert Maps to objects for JSON serialization
+        startEventData.state = {
+            topicTags: Object.fromEntries(taskLocalState.memory.state.topicTags),
+            taggedMessages: Object.fromEntries(taskLocalState.memory.state.taggedMessages),
+            topicCompaction: taskLocalState.memory.state.topicCompaction ?
+                Object.fromEntries(taskLocalState.memory.state.topicCompaction) : undefined,
+            lastProcessedIndex: taskLocalState.memory.state.lastProcessedIndex
+        };
+    }
+
+    const metaStartEvent: MetaMemoryEvent = {
+        type: 'metamemory_event',
+        operation: 'tagging_start',
+        eventId: uuidv4(),
+        data: startEventData,
+        timestamp: Date.now()
+    };
+    asyncEventQueue.push(metaStartEvent);
+
+    // Mark as processing to prevent concurrent runs
+    taskLocalState.memory.processing = true;
+    taskLocalState.memory.lastProcessingStartTime = Date.now();
+
+    // Fire and forget - process in background with timeout
+    const processingStart = Date.now();
+    const MEMORY_TIMEOUT = 3 * 60 * 1000; // 3 minutes
+
+    const memoryPromise = metamemory.processMessages([...messages]);
+    const timeoutPromise = new Promise<void>((_, reject) => {
+        const timeoutId = setTimeout(() => reject(new Error('Metamemory processing timeout after 3 minutes')), MEMORY_TIMEOUT);
+        
+        // Listen for abort signal
+        if (abortSignal) {
+            abortSignal.addEventListener('abort', () => {
+                clearTimeout(timeoutId);
+                reject(new Error('Metamemory processing aborted'));
+            });
+        }
+    });
+
+    const memoryOp = Promise.race([memoryPromise, timeoutPromise]).then(async (result) => {
+        const processingTime = Math.round((Date.now() - processingStart) / 1000);
+        if (taskLocalState?.memory) {
+            taskLocalState.memory.state = metamemory.getState();
+            console.log(`[Task] Metamemory background processing completed in ${processingTime}s`);
+
+            // Check for compaction after processing
+            try {
+                await metamemory.checkCompact([...messages]);
+            } catch (error) {
+                console.error('[Task] Error checking compaction:', error);
+            }
+
+            // Create processing complete event
+            const stateForSerialization = {
+                topicTags: Object.fromEntries(taskLocalState.memory.state.topicTags),
+                taggedMessages: Object.fromEntries(taskLocalState.memory.state.taggedMessages),
+                topicCompaction: taskLocalState.memory.state.topicCompaction ?
+                    Object.fromEntries(taskLocalState.memory.state.topicCompaction) : undefined,
+                lastProcessedIndex: taskLocalState.memory.state.lastProcessedIndex
+            };
+
+            const completeEvent: MetaMemoryEvent = {
+                type: 'metamemory_event',
+                operation: 'tagging_complete',
+                eventId: metaStartEvent.eventId,
+                data: {
+                    messageCount: messages.length,
+                    processingTime: processingTime * 1000,
+                    state: stateForSerialization,
+                    ...result,
+                },
+                timestamp: Date.now()
+            };
+            asyncEventQueue.push(completeEvent);
+        }
+    }).catch(error => {
+        const isTimeout = error.message?.includes('timeout');
+        console.error(`[Task] ${isTimeout ? 'Timeout' : 'Error'} in metamemory background processing:`, error);
+    }).finally(() => {
+        if (taskLocalState?.memory) {
+            taskLocalState.memory.processing = false;
+            taskLocalState.memory.lastProcessingStartTime = undefined;
+        }
+        pendingAsyncOps.delete(memoryOp);
+    });
+
+    // Track this operation
+    pendingAsyncOps.add(memoryOp);
+}
+
+/**
+ * Process meta cognition with timer-based triggering
+ */
+async function processMetaCognition(
+    agent: Agent,
+    messages: ResponseInput,
+    metaState: MetaProcessingState,
+    taskLocalState: TaskLocalState,
+    startTime: number,
+    asyncEventQueue: (MetaMemoryEvent | MetaCognitionEvent)[],
+    pendingAsyncOps: Set<Promise<void>>,
+    abortSignal?: AbortSignal
+): Promise<void> {
+    // Check if processing is stuck
+    if (taskLocalState.cognition?.processing) {
+        const STUCK_THRESHOLD = 2 * 60 * 1000; // 2 minutes
+        const processingTime = taskLocalState.cognition.lastProcessingStartTime 
+            ? Date.now() - taskLocalState.cognition.lastProcessingStartTime 
+            : 0;
+            
+        if (processingTime > STUCK_THRESHOLD) {
+            console.warn(`[Task] Meta cognition processing appears stuck (running for ${Math.round(processingTime / 1000)}s), forcibly resetting`);
+            taskLocalState.cognition.processing = false;
+            taskLocalState.cognition.lastProcessingStartTime = undefined;
+        } else {
+            return; // Still processing within reasonable time
+        }
+    }
+    
+    if (metaState.unprocessedCognitionMessages.length === 0) {
+        return;
+    }
+
+    console.log(`[Task] Processing meta cognition with ${metaState.unprocessedCognitionMessages.length} unprocessed messages`);
+
+    // Clear the unprocessed messages
+    metaState.unprocessedCognitionMessages = [];
+    metaState.lastCognitionProcessTime = Date.now();
+    // Note: messagesSinceLastCognition is reset immediately when triggering to prevent race conditions
+
+    // Emit metacognition start event
+    const serializedCognitionState = taskLocalState?.cognition ? {
+        ...taskLocalState.cognition,
+        disabledModels: taskLocalState.cognition.disabledModels ?
+            Array.from(taskLocalState.cognition.disabledModels) : undefined
+    } : undefined;
+
+    const metaStartEvent: MetaCognitionEvent = {
+        type: 'metacognition_event',
+        operation: 'analysis_start',
+        eventId: uuidv4(),
+        data: {
+            requestCount: taskLocalState.requestCount,
+            state: serializedCognitionState
+        },
+        timestamp: Date.now()
+    };
+    asyncEventQueue.push(metaStartEvent);
+
+    // Mark as processing to prevent concurrent runs
+    if (taskLocalState.cognition) {
+        taskLocalState.cognition.processing = true;
+        taskLocalState.cognition.lastProcessingStartTime = Date.now();
+    }
+
+    // Fire and forget - process in background with timeout
+    const processingStart = Date.now();
+    const COGNITION_TIMEOUT = 3 * 60 * 1000; // 3 minutes
+
+    const cognitionPromise = spawnMetaThought(agent, messages, new Date(startTime), taskLocalState.requestCount || 0, taskLocalState);
+    const timeoutPromise = new Promise<never>((_, reject) => {
+        const timeoutId = setTimeout(() => reject(new Error('Meta-cognition processing timeout after 3 minutes')), COGNITION_TIMEOUT);
+        
+        // Listen for abort signal
+        if (abortSignal) {
+            abortSignal.addEventListener('abort', () => {
+                clearTimeout(timeoutId);
+                reject(new Error('Meta-cognition processing aborted'));
+            });
+        }
+    });
+
+    const cognitionOp = Promise.race([cognitionPromise, timeoutPromise]).then((result) => {
+        const processingTime = Math.round((Date.now() - processingStart) / 1000);
+
+        // Emit metacognition complete event
+        const serializedCompleteCognitionState = taskLocalState?.cognition ? {
+            ...taskLocalState.cognition,
+            disabledModels: taskLocalState.cognition.disabledModels ?
+                Array.from(taskLocalState.cognition.disabledModels) : undefined
+        } : undefined;
+
+        const metaCompleteEvent: MetaCognitionEvent = {
+            type: 'metacognition_event',
+            operation: 'analysis_complete',
+            eventId: metaStartEvent.eventId,
+            data: {
+                requestCount: taskLocalState?.requestCount || 0,
+                processingTime: processingTime * 1000,
+                ...result,
+                state: serializedCompleteCognitionState
+            },
+            timestamp: Date.now()
+        };
+        asyncEventQueue.push(metaCompleteEvent);
+
+        console.log(`[Task] Meta-cognition background processing completed in ${processingTime}s`);
+    }).catch(error => {
+        const isTimeout = error.message?.includes('timeout');
+        console.error(`[Task] ${isTimeout ? 'Timeout' : 'Error'} in meta-cognition background processing:`, error);
+    }).finally(() => {
+        if (taskLocalState?.cognition) {
+            taskLocalState.cognition.processing = false;
+            taskLocalState.cognition.lastProcessingStartTime = undefined;
+        }
+        pendingAsyncOps.delete(cognitionOp);
+    });
+
+    // Track this operation
+    pendingAsyncOps.add(cognitionOp);
 }
 
 /**
@@ -201,8 +480,8 @@ export function runTask(
             // Build initial messages with tool guidance
             const toolGuidance = 'You must complete tasks by using the provided tools. When you have finished a task, you MUST call the task_complete() tool with a comprehensive result. If you cannot complete the task, you MUST call the task_fatal_error() tool with an explanation. Do not just provide a final answer without using these tools.';
 
-            // Check if agent instructions already contain task_complete guidance
-            if(!agentDef.instructions?.includes('task_complete')) {
+            // Check if agent instructions already contain the exact tool guidance
+            if(!agentDef.instructions?.includes(toolGuidance)) {
                 agentDef.instructions = agentDef.instructions ? `${agentDef.instructions}\n\n${toolGuidance}` : toolGuidance;
             }
         }
@@ -244,16 +523,28 @@ export function runTask(
         taskLocalState.delayAbortController = new AbortController();
 
         taskLocalState.cognition = taskLocalState?.cognition || {};
+        taskLocalState.cognition.enabled = taskLocalState?.cognition?.enabled !== undefined ? taskLocalState.cognition.enabled : true;
         taskLocalState.cognition.frequency = taskLocalState?.cognition?.frequency || 10;
         taskLocalState.cognition.thoughtDelay = taskLocalState?.cognition?.thoughtDelay || getThoughtDelay();
         // Reconstruct Set from array if needed (Sets don't serialize properly)
-        taskLocalState.cognition.disabledModels = taskLocalState?.cognition?.disabledModels 
+        taskLocalState.cognition.disabledModels = taskLocalState.cognition.disabledModels 
             ? new Set(Array.isArray(taskLocalState.cognition.disabledModels) 
                 ? taskLocalState.cognition.disabledModels 
                 : taskLocalState.cognition.disabledModels)
             : new Set();
-        taskLocalState.cognition.modelScores = taskLocalState?.cognition?.modelScores || {};
-        taskLocalState.cognition.processing = false; // Always reset processing flag
+        taskLocalState.cognition.modelScores = taskLocalState.cognition.modelScores || {};
+        
+        // Check for stuck cognition processing before we do anything else
+        if (taskLocalState.cognition.processing && taskLocalState.cognition.lastProcessingStartTime) {
+            const STUCK_THRESHOLD = 2 * 60 * 1000; // 2 minutes
+            const processingTime = Date.now() - taskLocalState.cognition.lastProcessingStartTime;
+            
+            if (processingTime > STUCK_THRESHOLD) {
+                console.warn(`[Task] Meta cognition processing appears stuck (running for ${Math.round(processingTime / 1000)}s), forcibly resetting`);
+                taskLocalState.cognition.processing = false;
+                taskLocalState.cognition.lastProcessingStartTime = undefined;
+            }
+        }
 
         taskLocalState.memory = taskLocalState?.memory || {};
         taskLocalState.memory.enabled = taskLocalState?.memory?.enabled || true;
@@ -282,7 +573,18 @@ export function runTask(
                 lastProcessedIndex: 0,
             };
         }
-        taskLocalState.memory.processing = false; // Always reset processing flag
+        
+        // Check for stuck memory processing before we do anything else
+        if (taskLocalState.memory.processing && taskLocalState.memory.lastProcessingStartTime) {
+            const STUCK_THRESHOLD = 2 * 60 * 1000; // 2 minutes
+            const processingTime = Date.now() - taskLocalState.memory.lastProcessingStartTime;
+            
+            if (processingTime > STUCK_THRESHOLD) {
+                console.warn(`[Task] Meta memory processing appears stuck (running for ${Math.round(processingTime / 1000)}s), forcibly resetting`);
+                taskLocalState.memory.processing = false;
+                taskLocalState.memory.lastProcessingStartTime = undefined;
+            }
+        }
 
         // Initialize metamemory if enabled
         let metamemory: Metamemory | undefined;
@@ -305,6 +607,90 @@ export function runTask(
 
         // Track pending async operations
         const pendingAsyncOps = new Set<Promise<void>>();
+        
+        // Create abort controller for meta processing operations
+        const metaProcessingAbortController = new AbortController();
+
+        // Initialize meta processing state
+        const metaState: MetaProcessingState = {
+            unprocessedMemoryMessages: [],
+            unprocessedCognitionMessages: [],
+            lastMemoryProcessTime: Date.now(),
+            lastCognitionProcessTime: Date.now(),
+            messagesSinceLastCognition: 0
+        };
+
+        // Initialize timers
+        const metaTimers: MetaProcessingTimers = {
+            memoryTimer: null, // Not used - kept for backwards compatibility
+            cognitionTimer: null,
+            memoryDebounceTimer: null,
+            cognitionDebounceTimer: null
+        };
+
+        // Helper function to bump memory timer
+        const bumpMetaMemoryTimer = () => {
+            // Clear existing debounce timer
+            if (metaTimers.memoryDebounceTimer) {
+                clearTimeout(metaTimers.memoryDebounceTimer);
+            }
+
+            // Set new debounce timer for 1 second
+            metaTimers.memoryDebounceTimer = setTimeout(() => {
+                if (taskLocalState) {
+                    processMetaMemory(metamemory, messages, metaState, taskLocalState, asyncEventQueue, pendingAsyncOps, metaProcessingAbortController.signal);
+                }
+            }, 1000);
+
+            // Check if we should process immediately due to batch size
+            if (metaState.unprocessedMemoryMessages.length >= 10) {
+                if (metaTimers.memoryDebounceTimer) {
+                    clearTimeout(metaTimers.memoryDebounceTimer);
+                    metaTimers.memoryDebounceTimer = null;
+                }
+                if (taskLocalState) {
+                    processMetaMemory(metamemory, messages, metaState, taskLocalState, asyncEventQueue, pendingAsyncOps, metaProcessingAbortController.signal);
+                }
+            }
+        };
+
+        // Helper function to bump cognition timer
+        const bumpMetaCognitionTimer = () => {
+            // Skip if cognition is disabled
+            if (!taskLocalState?.cognition?.enabled) {
+                return;
+            }
+            
+            // Increment message counter
+            metaState.messagesSinceLastCognition++;
+            
+            // Check if we should process based on message count
+            if (metaState.messagesSinceLastCognition >= (taskLocalState?.cognition?.frequency || 10)) {
+                // Reset counter immediately to prevent multiple triggers
+                metaState.messagesSinceLastCognition = 0;
+                
+                // Clear any existing debounce timer
+                if (metaTimers.cognitionDebounceTimer) {
+                    clearTimeout(metaTimers.cognitionDebounceTimer);
+                    metaTimers.cognitionDebounceTimer = null;
+                }
+                
+                // Set a 1-second debounce before processing
+                metaTimers.cognitionDebounceTimer = setTimeout(() => {
+                    if (taskLocalState) {
+                        processMetaCognition(agent, messages, metaState, taskLocalState, startTime, asyncEventQueue, pendingAsyncOps, metaProcessingAbortController.signal);
+                    }
+                }, 1000);
+            }
+        };
+
+        // Set up periodic timer for cognition only
+        // (Memory doesn't need periodic timer since every message is processed after 1s debounce)
+        metaTimers.cognitionTimer = setInterval(() => {
+            if (messages.length > 0 && taskLocalState && taskLocalState.cognition?.enabled) {
+                processMetaCognition(agent, messages, metaState, taskLocalState, startTime, asyncEventQueue, pendingAsyncOps, metaProcessingAbortController.signal);
+            }
+        }, 180000); // Every 3 minutes
 
         try {
             //console.log(`[Task] Starting execution for agent: ${agent.name}`);
@@ -350,132 +736,6 @@ export function runTask(
                     yield asyncEvent;
                 }
 
-                // Check meta-cognition triggers
-                const metaFrequency = taskLocalState.cognition.frequency;
-                let shouldTriggerMetacognition = false;
-                
-                // Debug logging for metacognition
-                console.log(`[Task] Checking metacognition triggers:`, {
-                    requestCount: taskLocalState.requestCount,
-                    frequency: metaFrequency,
-                    modulo: taskLocalState.requestCount % metaFrequency,
-                    processing: taskLocalState.cognition.processing,
-                    condition1: taskLocalState.requestCount > 0,
-                    condition2: taskLocalState.requestCount % metaFrequency === 0,
-                    condition3: !taskLocalState.cognition.processing
-                });
-                
-                // Trigger 1: Regular frequency-based trigger
-                if (taskLocalState.requestCount > 0 && taskLocalState.requestCount % metaFrequency === 0 && !taskLocalState.cognition.processing) {
-                    console.log(`[Task] Metacognition frequency trigger: request ${taskLocalState.requestCount} is divisible by ${metaFrequency}`);
-                    shouldTriggerMetacognition = true;
-                }
-                
-                // Trigger 2: Topic change detection (using metamemory)
-                if (!shouldTriggerMetacognition && taskLocalState.memory.state && taskLocalState.requestCount > 2) {
-                    // Get recent messages to check for topic changes
-                    const recentMessages = messages.slice(-3);
-                    const recentTopics = new Set<string>();
-                    
-                    // Collect topics from recent messages
-                    for (const msg of recentMessages) {
-                        if (msg.id && taskLocalState.memory.state.taggedMessages.has(msg.id)) {
-                            const metadata = taskLocalState.memory.state.taggedMessages.get(msg.id);
-                            if (metadata) {
-                                metadata.topic_tags.forEach(tag => recentTopics.add(tag));
-                            }
-                        }
-                    }
-                    
-                    // Check if we have active topics in recent messages
-                    const activeTopics = Array.from(taskLocalState.memory.state.topicTags.entries())
-                        .filter(([_, meta]) => meta.type === 'active')
-                        .map(([tag, _]) => tag);
-                    
-                    // If no recent topics overlap with active topics, we might have switched topics
-                    const hasTopicSwitch = activeTopics.length > 0 && 
-                        activeTopics.every(topic => !recentTopics.has(topic));
-                    
-                    if (hasTopicSwitch && !taskLocalState.cognition.processing) {
-                        console.log('[Task] Detected topic switch, triggering metacognition');
-                        shouldTriggerMetacognition = true;
-                    }
-                }
-                
-                if (shouldTriggerMetacognition) {
-                    //console.log(`[Task] Triggering meta-cognition after ${taskLocalState.requestCount} requests`);
-
-                    // Emit metacognition start event
-                    // Convert Set to array for JSON serialization
-                    const serializedCognitionState = taskLocalState?.cognition ? {
-                        ...taskLocalState.cognition,
-                        disabledModels: taskLocalState.cognition.disabledModels ?
-                            Array.from(taskLocalState.cognition.disabledModels) : undefined
-                    } : undefined;
-
-                    const metaStartEvent: MetaCognitionEvent = {
-                        type: 'metacognition_event',
-                        operation: 'analysis_start',
-                        eventId: uuidv4(), // Unique ID for the event
-                        data: {
-                            requestCount: taskLocalState.requestCount,
-                            state: serializedCognitionState
-                        },
-                        timestamp: Date.now()
-                    };
-                    yield metaStartEvent;
-
-                    // Mark as processing to prevent concurrent runs
-                    taskLocalState.cognition.processing = true;
-
-                    // Fire and forget - process in background with timeout
-                    const processingStart = Date.now();
-                    const COGNITION_TIMEOUT = 3 * 60 * 1000; // 3 minutes
-
-                    const cognitionPromise = spawnMetaThought(agentDef, messages, new Date(startTime), taskLocalState.requestCount, taskLocalState);
-                    const timeoutPromise = new Promise<never>((_, reject) =>
-                        setTimeout(() => reject(new Error('Meta-cognition processing timeout after 3 minutes')), COGNITION_TIMEOUT)
-                    );
-
-                    const cognitionOp = Promise.race([cognitionPromise, timeoutPromise]).then((result) => {
-                        const processingTime = Math.round((Date.now() - processingStart) / 1000);
-
-                        // Emit metacognition complete event
-                        // Convert Set to array for JSON serialization
-                        const serializedCompleteCognitionState = taskLocalState?.cognition ? {
-                            ...taskLocalState.cognition,
-                            disabledModels: taskLocalState.cognition.disabledModels ?
-                                Array.from(taskLocalState.cognition.disabledModels) : undefined
-                        } : undefined;
-
-                        const metaCompleteEvent: MetaCognitionEvent = {
-                            type: 'metacognition_event',
-                            operation: 'analysis_complete',
-                            eventId: metaStartEvent.eventId, // Unique ID for the event
-                            data: {
-                                requestCount: taskLocalState?.requestCount || 0,
-                                processingTime: processingTime * 1000,
-                                ...result,
-                                state: serializedCompleteCognitionState
-                            },
-                            timestamp: Date.now()
-                        };
-                        asyncEventQueue.push(metaCompleteEvent);
-
-                        console.log(`[Task] Meta-cognition background processing completed in ${processingTime}s`);
-                    }).catch(error => {
-                        const isTimeout = error.message?.includes('timeout');
-                        console.error(`[Task] ${isTimeout ? 'Timeout' : 'Error'} in meta-cognition background processing:`, error);
-                    }).finally(() => {
-                        if (taskLocalState?.cognition) {
-                            taskLocalState.cognition.processing = false;
-                        }
-                        pendingAsyncOps.delete(cognitionOp);
-                    });
-
-                    // Track this operation
-                    pendingAsyncOps.add(cognitionOp);
-                }
 
                 // Compact messages before ensemble request if metamemory is enabled
                 let messagesToProcess = messages;
@@ -528,95 +788,16 @@ export function runTask(
                             }
                             messages.push(responseEvent.message);
 
-                            // Process with metamemory if enabled
-                            if (metamemory && taskLocalState.memory.state && taskLocalState.memory.enabled && !taskLocalState.memory.processing) {
-                                // Emit metamemory tagging started event
-                                // Include current state if available
-                                const startEventData: any = {
-                                    messageCount: messages.length
-                                };
+                            // Add to unprocessed queues
+                            metaState.unprocessedMemoryMessages.push(responseEvent.message);
+                            metaState.unprocessedCognitionMessages.push(responseEvent.message);
 
-                                if (taskLocalState.memory.state) {
-                                    // Convert Maps to objects for JSON serialization
-                                    startEventData.state = {
-                                        topicTags: Object.fromEntries(taskLocalState.memory.state.topicTags),
-                                        taggedMessages: Object.fromEntries(taskLocalState.memory.state.taggedMessages),
-                                        topicCompaction: taskLocalState.memory.state.topicCompaction ?
-                                            Object.fromEntries(taskLocalState.memory.state.topicCompaction) : undefined,
-                                        lastProcessedIndex: taskLocalState.memory.state.lastProcessedIndex
-                                    };
-                                }
-
-                                const metaStartEvent: MetaMemoryEvent = {
-                                    type: 'metamemory_event',
-                                    operation: 'tagging_start',
-                                    eventId: uuidv4(), // Unique ID for the event
-                                    data: startEventData,
-                                    timestamp: Date.now()
-                                };
-                                yield metaStartEvent;
-
-                                // Mark as processing to prevent concurrent runs
-                                taskLocalState.memory.processing = true;
-
-                                // Fire and forget - process in background with timeout
-                                const processingStart = Date.now();
-                                const MEMORY_TIMEOUT = 3 * 60 * 1000; // 3 minutes
-
-                                const memoryPromise = metamemory.processMessages([...messages]);
-                                const timeoutPromise = new Promise<void>((_, reject) =>
-                                    setTimeout(() => reject(new Error('Metamemory processing timeout after 3 minutes')), MEMORY_TIMEOUT)
-                                );
-
-                                const memoryOp = Promise.race([memoryPromise, timeoutPromise]).then(async (result) => {
-                                    const processingTime = Math.round((Date.now() - processingStart) / 1000);
-                                    if (taskLocalState?.memory) {
-                                        taskLocalState.memory.state = metamemory.getState();
-                                        console.log(`[Task] Metamemory background processing completed in ${processingTime}s`);
-
-                                        // Check for compaction after processing
-                                        try {
-                                            await metamemory.checkCompact([...messages]);
-                                        } catch (error) {
-                                            console.error('[Task] Error checking compaction:', error);
-                                        }
-
-                                        // Create processing complete event
-                                        // Convert Maps to objects for JSON serialization
-                                        const stateForSerialization = {
-                                            topicTags: Object.fromEntries(taskLocalState.memory.state.topicTags),
-                                            taggedMessages: Object.fromEntries(taskLocalState.memory.state.taggedMessages),
-                                            topicCompaction: taskLocalState.memory.state.topicCompaction ?
-                                                Object.fromEntries(taskLocalState.memory.state.topicCompaction) : undefined,
-                                            lastProcessedIndex: taskLocalState.memory.state.lastProcessedIndex
-                                        };
-
-                                        const completeEvent: MetaMemoryEvent = {
-                                            type: 'metamemory_event',
-                                            operation: 'tagging_complete',
-                                            eventId: metaStartEvent.eventId, // Unique ID for the event
-                                            data: {
-                                                messageCount: messages.length,
-                                                processingTime: processingTime * 1000,
-                                                state: stateForSerialization,
-                                                ...result,
-                                            },
-                                            timestamp: Date.now()
-                                        };
-                                        asyncEventQueue.push(completeEvent);
-                                    }
-                                }).catch(error => {
-                                    const isTimeout = error.message?.includes('timeout');
-                                    console.error(`[Task] ${isTimeout ? 'Timeout' : 'Error'} in metamemory background processing:`, error);
-                                }).finally(() => {
-                                    if (taskLocalState?.memory) {
-                                        taskLocalState.memory.processing = false;
-                                    }
-                                    pendingAsyncOps.delete(memoryOp);
-                                });
-
-                                // Track this operation
-                                pendingAsyncOps.add(memoryOp);
+                            // Bump timers
+                            if (metamemory && taskLocalState.memory.enabled) {
+                                bumpMetaMemoryTimer();
+                            }
+                            if (taskLocalState.cognition?.enabled) {
+                                bumpMetaCognitionTimer();
                             }
                         }
                     }
@@ -677,6 +858,20 @@ export function runTask(
                 error: new Error(`Agent execution failed: ${errorMessage}`)
             } as ProviderStreamEvent;
         } finally {
+            // Abort any ongoing meta processing operations
+            metaProcessingAbortController.abort();
+            
+            // Clean up all timers
+            if (metaTimers.cognitionTimer) {
+                clearInterval(metaTimers.cognitionTimer);
+            }
+            if (metaTimers.memoryDebounceTimer) {
+                clearTimeout(metaTimers.memoryDebounceTimer);
+            }
+            if (metaTimers.cognitionDebounceTimer) {
+                clearTimeout(metaTimers.cognitionDebounceTimer);
+            }
+
             // Yield any remaining async events
             while (asyncEventQueue.length > 0) {
                 const asyncEvent = asyncEventQueue.shift()!;

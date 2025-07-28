@@ -62,6 +62,11 @@ export interface MetaCognitionEvent {
 
         adjustments?: string[];
         injectedThoughts?: string[];
+        toolCalls?: Array<{
+            name: string;
+            arguments: any;
+            summary: string;
+        }>;
     };
     timestamp: number;
 }

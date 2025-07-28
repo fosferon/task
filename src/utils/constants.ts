@@ -17,7 +17,7 @@ export type ThoughtDelay = typeof VALID_THOUGHT_DELAYS[number];
 /**
  * Default values
  */
-export const DEFAULT_META_FREQUENCY: MetaFrequency = 5;
+export const DEFAULT_META_FREQUENCY: MetaFrequency = 10;
 export const DEFAULT_THOUGHT_DELAY: ThoughtDelay = 0;
 export const DEFAULT_MODEL_SCORE = 50;
 

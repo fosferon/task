@@ -5,22 +5,30 @@ interface TaskSettingsProps {
   onSettingsChange: (settings: {
     metaFrequency: string;
     metamemoryEnabled: boolean;
+    runIndefinitely: boolean;
   }) => void;
 }
 
 export default function TaskSettings({ onSettingsChange }: TaskSettingsProps) {
   const [metaFrequency, setMetaFrequency] = useState('5')
   const [metamemoryEnabled, setMetamemoryEnabled] = useState(true)
+  const [runIndefinitely, setRunIndefinitely] = useState(false)
 
   const handleFrequencyChange = (value: string) => {
     setMetaFrequency(value)
-    onSettingsChange({ metaFrequency: value, metamemoryEnabled })
+    onSettingsChange({ metaFrequency: value, metamemoryEnabled, runIndefinitely })
   }
 
   const handleMemoryToggle = () => {
     const newValue = !metamemoryEnabled
     setMetamemoryEnabled(newValue)
-    onSettingsChange({ metaFrequency, metamemoryEnabled: newValue })
+    onSettingsChange({ metaFrequency, metamemoryEnabled: newValue, runIndefinitely })
+  }
+
+  const handleIndefinitelyToggle = () => {
+    const newValue = !runIndefinitely
+    setRunIndefinitely(newValue)
+    onSettingsChange({ metaFrequency, metamemoryEnabled, runIndefinitely: newValue })
   }
 
   return (
@@ -64,6 +72,18 @@ export default function TaskSettings({ onSettingsChange }: TaskSettingsProps) {
           />
           <span style={{ fontSize: '14px', color: 'var(--text)' }}>
             Enable Metamemory
+          </span>
+        </label>
+
+        <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
+          <input
+            type="checkbox"
+            checked={runIndefinitely}
+            onChange={handleIndefinitelyToggle}
+            style={{ cursor: 'pointer' }}
+          />
+          <span style={{ fontSize: '14px', color: 'var(--text)' }}>
+            Conversation Mode (Run Indefinitely)
           </span>
         </label>
       </div>
