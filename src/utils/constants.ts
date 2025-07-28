@@ -1,5 +1,6 @@
 /**
  * Shared constants for the Task system
+ * @module constants
  */
 
 /**
