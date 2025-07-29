@@ -547,7 +547,7 @@ export function runTask(
         }
 
         taskLocalState.memory = taskLocalState?.memory || {};
-        taskLocalState.memory.enabled = taskLocalState?.memory?.enabled || true;
+        taskLocalState.memory.enabled = taskLocalState?.memory?.enabled !== undefined ? taskLocalState.memory.enabled : true;
         
         // Reconstruct Maps from objects if needed (Maps don't serialize properly)
         if (taskLocalState.memory.state) {
