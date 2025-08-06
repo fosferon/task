@@ -126,6 +126,10 @@ async function processMetaMemory(
         return;
     }
 
+    // Mark as processing BEFORE clearing unprocessed messages to prevent race condition
+    taskLocalState.memory.processing = true;
+    taskLocalState.memory.lastProcessingStartTime = Date.now();
+
     console.log(`[Task] Processing ${unprocessedMessages.length} messages for meta memory`);
 
     // Clear the unprocessed messages
@@ -157,10 +161,6 @@ async function processMetaMemory(
         timestamp: Date.now()
     };
     asyncEventQueue.push(metaStartEvent);
-
-    // Mark as processing to prevent concurrent runs
-    taskLocalState.memory.processing = true;
-    taskLocalState.memory.lastProcessingStartTime = Date.now();
 
     // Fire and forget - process in background with timeout
     const processingStart = Date.now();
@@ -630,6 +630,20 @@ export function runTask(
 
         // Helper function to bump memory timer
         const bumpMetaMemoryTimer = () => {
+            // Check if we should process immediately due to batch size
+            if (metaState.unprocessedMemoryMessages.length >= 10) {
+                // Clear any existing timer to prevent duplicate processing
+                if (metaTimers.memoryDebounceTimer) {
+                    clearTimeout(metaTimers.memoryDebounceTimer);
+                    metaTimers.memoryDebounceTimer = null;
+                }
+                // Process immediately if not already processing
+                if (taskLocalState && !taskLocalState.memory?.processing) {
+                    processMetaMemory(metamemory, messages, metaState, taskLocalState, asyncEventQueue, pendingAsyncOps, metaProcessingAbortController.signal);
+                }
+                return;
+            }
+
             // Clear existing debounce timer
             if (metaTimers.memoryDebounceTimer) {
                 clearTimeout(metaTimers.memoryDebounceTimer);
@@ -637,21 +651,12 @@ export function runTask(
 
             // Set new debounce timer for 1 second
             metaTimers.memoryDebounceTimer = setTimeout(() => {
-                if (taskLocalState) {
+                // Check again if not already processing
+                if (taskLocalState && !taskLocalState.memory?.processing) {
                     processMetaMemory(metamemory, messages, metaState, taskLocalState, asyncEventQueue, pendingAsyncOps, metaProcessingAbortController.signal);
                 }
+                metaTimers.memoryDebounceTimer = null;
             }, 1000);
-
-            // Check if we should process immediately due to batch size
-            if (metaState.unprocessedMemoryMessages.length >= 10) {
-                if (metaTimers.memoryDebounceTimer) {
-                    clearTimeout(metaTimers.memoryDebounceTimer);
-                    metaTimers.memoryDebounceTimer = null;
-                }
-                if (taskLocalState) {
-                    processMetaMemory(metamemory, messages, metaState, taskLocalState, asyncEventQueue, pendingAsyncOps, metaProcessingAbortController.signal);
-                }
-            }
         };
 
         // Helper function to bump cognition timer
@@ -708,7 +713,17 @@ export function runTask(
                 taskStartEmitted = true;
             }
 
+            // Error tracking for detecting unrecoverable failures
+            let consecutiveSameErrors = 0;
+            let lastErrorMessage = '';
+            let totalErrors = 0;
+            const MAX_CONSECUTIVE_SAME_ERRORS = taskLocalState.errorHandling?.maxConsecutiveInitErrors ?? 3;
+            const MAX_TOTAL_ERRORS = taskLocalState.errorHandling?.maxTotalErrors ?? 10;
+            
             while (!isComplete) {
+                // Track current error message for reporting
+                let currentErrorMessage = '';
+                
                 // Wait if ensemble is paused (before any processing)
                 await waitWhilePaused();
 
@@ -751,6 +766,34 @@ export function runTask(
                 // Run ensemble request and yield all events
                 console.log(`[Task] Starting ensemble request with ${messagesToProcess.length} messages`);
                 for await (const event of ensembleRequest(messagesToProcess, agentDef)) {
+                    // Track errors BEFORE yielding so we can stop the task
+                    if (event.type === 'error') {
+                        currentErrorMessage = (event as any).error || (event as any).message || 'Unknown error';
+                        totalErrors++;
+                        
+                        // Check if it's the same error repeating
+                        if (currentErrorMessage === lastErrorMessage) {
+                            consecutiveSameErrors++;
+                        } else {
+                            consecutiveSameErrors = 1;
+                            lastErrorMessage = currentErrorMessage;
+                        }
+                        
+                        
+                        // Check if we should stop immediately
+                        if (consecutiveSameErrors >= MAX_CONSECUTIVE_SAME_ERRORS || totalErrors >= MAX_TOTAL_ERRORS) {
+                            // Break out of the for-await loop to trigger error handling below
+                            break;
+                        }
+                    }
+                    
+                    // Reset error counts on actual progress (successful response or tool completion)
+                    if (event.type === 'response_output' || 
+                        (event.type === 'tool_done' && !(event as any).error)) {
+                        consecutiveSameErrors = 0; // Reset - agent made progress
+                        lastErrorMessage = ''; // Clear last error
+                    }
+                    
                     // Check for any async events that were queued
                     while (asyncEventQueue.length > 0) {
                         const asyncEvent = asyncEventQueue.shift()!;
@@ -807,6 +850,39 @@ export function runTask(
                 while (asyncEventQueue.length > 0) {
                     const asyncEvent = asyncEventQueue.shift()!;
                     yield asyncEvent;
+                }
+                
+                // After the for-await loop, check error patterns
+                if (consecutiveSameErrors >= MAX_CONSECUTIVE_SAME_ERRORS) {
+                    console.error(`[Task] Same error repeated ${consecutiveSameErrors} times - stopping task`);
+                    isComplete = true;
+                    taskCompleted = true;
+                    
+                    // Emit task_fatal_error event
+                    const fatalEvent: TaskFatalErrorEvent = {
+                        type: 'task_fatal_error',
+                        task_id: taskId,
+                        result: `Task terminated: Same error repeated ${consecutiveSameErrors} times. Error: ${lastErrorMessage}`,
+                        finalState: {
+                            ...taskLocalState
+                        }
+                    };
+                    yield fatalEvent;
+                } else if (totalErrors >= MAX_TOTAL_ERRORS) {
+                    console.error(`[Task] Too many errors (${totalErrors}/${MAX_TOTAL_ERRORS}) - stopping task`);
+                    isComplete = true;
+                    taskCompleted = true;
+                    
+                    // Emit task_fatal_error event
+                    const fatalEvent: TaskFatalErrorEvent = {
+                        type: 'task_fatal_error',
+                        task_id: taskId,
+                        result: `Task terminated: Too many errors (${totalErrors}). Last error: ${currentErrorMessage}`,
+                        finalState: {
+                            ...taskLocalState
+                        }
+                    };
+                    yield fatalEvent;
                 }
             }
 

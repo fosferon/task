@@ -79,4 +79,13 @@ export interface TaskLocalState {
         /** Timestamp when processing started (for detecting stuck states) */
         lastProcessingStartTime?: number;
     }
+
+    /** Error handling configuration */
+    errorHandling?: {
+        /** Maximum consecutive initialization errors before stopping (default: 3) */
+        maxConsecutiveInitErrors?: number;
+        
+        /** Maximum total errors before stopping (default: 10) */
+        maxTotalErrors?: number;
+    }
 }
