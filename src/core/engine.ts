@@ -92,7 +92,7 @@ interface MetaProcessingState {
 /**
  * Get Task control tools
  */
-function getTaskTools(): ToolFunction[] {
+export function getTaskTools(): ToolFunction[] {
   return [
     createToolFunction(
       (result: string) => {
@@ -110,6 +110,7 @@ function getTaskTools(): ToolFunction[] {
       },
       undefined,
       'task_complete',
+      false, // allowSummary set to false
     ),
 
     createToolFunction(
@@ -127,6 +128,7 @@ function getTaskTools(): ToolFunction[] {
       },
       undefined,
       'task_fatal_error',
+      false, // allowSummary set to false
     ),
   ];
 }
