@@ -18,6 +18,7 @@ import type {
   TaskEvent,
   MetaMemoryEvent,
   MetaCognitionEvent,
+  TaskStatusEvent,
 } from '../types/events.js';
 import {
   ensembleRequest,
@@ -52,6 +53,24 @@ const activeTaskMessages = new WeakMap<
 const generatorCleanup = new WeakMap<
   AsyncGenerator<TaskStreamEvent>,
   () => void
+>();
+
+// WeakMap to store task local state for active tasks
+const activeTaskLocalStates = new WeakMap<
+  AsyncGenerator<TaskStreamEvent>,
+  TaskLocalState
+>();
+
+// WeakMap to store task IDs for active tasks
+const activeTaskIds = new WeakMap<
+  AsyncGenerator<TaskStreamEvent>,
+  string
+>();
+
+// WeakMap to track completed tasks
+const completedTasks = new WeakMap<
+  AsyncGenerator<TaskStreamEvent>,
+  boolean
 >();
 
 // Timer management interfaces
@@ -1188,28 +1207,71 @@ export function runTask(
   // Store the messages array in the WeakMap
   activeTaskMessages.set(generator, messages);
 
-  // Set up cleanup function
+  // Set up cleanup function that will clean up the wrapped generator
+  let cleanupRef: AsyncGenerator<TaskStreamEvent> | null = null;
   const cleanup = () => {
-    activeTaskMessages.delete(generator);
-    generatorCleanup.delete(generator);
+    if (cleanupRef) {
+      activeTaskMessages.delete(cleanupRef);
+      activeTaskLocalStates.delete(cleanupRef);
+      activeTaskIds.delete(cleanupRef);
+      completedTasks.delete(cleanupRef);
+      generatorCleanup.delete(cleanupRef);
+    }
   };
-  generatorCleanup.set(generator, cleanup);
+
+  // Store initial references for the generator
+  activeTaskLocalStates.set(generator, taskLocalState || {});
+  activeTaskIds.set(generator, 'pending');
 
   // Create a wrapper that ensures cleanup
-  const wrappedGenerator =
-    (async function* (): AsyncGenerator<TaskStreamEvent> {
-      try {
-        for await (const event of generator) {
-          yield event;
+  // We need to store a reference to the wrapped generator for the closure
+  let wrapperRef: AsyncGenerator<TaskStreamEvent> | null = null;
+
+  const wrappedGenerator = (async function* (): AsyncGenerator<TaskStreamEvent> {
+    let taskIdCaptured = false;
+    try {
+      for await (const event of generator) {
+        // Capture task ID from first event with task_id
+        if (!taskIdCaptured && 'task_id' in event && event.task_id) {
+          const taskId = (event as any).task_id;
+          if (wrapperRef) {
+            activeTaskIds.set(wrapperRef, taskId);
+            activeTaskIds.delete(generator);
+          }
+          taskIdCaptured = true;
         }
-      } finally {
-        cleanup();
+        // Update task local state on each event
+        if ('finalState' in event && event.finalState) {
+          const finalState = (event as any).finalState;
+          if (wrapperRef) {
+            activeTaskLocalStates.set(wrapperRef, finalState);
+            activeTaskLocalStates.delete(generator);
+          }
+        }
+        // Mark task as completed when we see completion events
+        if (event.type === 'task_complete' || event.type === 'task_fatal_error') {
+          if (wrapperRef) {
+            completedTasks.set(wrapperRef, true);
+          }
+        }
+        yield event;
       }
-    })();
+    } finally {
+      cleanup();
+    }
+  })();
+
+  // Set the reference now that it's created
+  wrapperRef = wrappedGenerator;
+  cleanupRef = wrappedGenerator; // IMPORTANT: Set cleanupRef so cleanup function works
 
   // Transfer the mapping to the wrapped generator
   activeTaskMessages.set(wrappedGenerator, messages);
   activeTaskMessages.delete(generator);
+  if (taskLocalState) {
+    activeTaskLocalStates.set(wrappedGenerator, taskLocalState);
+  }
+  activeTaskLocalStates.delete(generator);
   generatorCleanup.set(wrappedGenerator, cleanup);
   generatorCleanup.delete(generator);
 
@@ -1293,4 +1355,143 @@ export function addMessageToTask(
 
   // Use the internal function
   internalAddMessage(messages, message, 'external');
+}
+
+/**
+ * Get the current status of an active task
+ *
+ * @param taskGenerator - The generator returned by runTask
+ * @param agent - The agent to use for generating the summary
+ * @returns Promise<TaskStatusEvent> - The status of the task
+ *
+ * @example
+ * ```typescript
+ * const task = runTask(agent, 'Analyze this code');
+ *
+ * // Get status while task is running
+ * const status = await taskStatus(task, agent);
+ * console.log(status.data.summary);
+ * ```
+ */
+export async function taskStatus(
+  taskGenerator: AsyncGenerator<ProviderStreamEvent>,
+  agent: Agent,
+  prompt: string = `Please provide a 2-3 sentence summary of the progress of this task. You do not need to explain what the task is, only progress performed. Provide at least a one sentence overview of overall task history. Also at least one sentence focusing on the recent/current state.`,
+): Promise<TaskStatusEvent> {
+  // Validate inputs
+  if (!taskGenerator) {
+    throw new Error('Task generator is required');
+  }
+
+  // Check if task is marked as completed
+  if (completedTasks.get(taskGenerator)) {
+    throw new Error(
+      'Task not found or already completed. Status can only be retrieved for active tasks.',
+    );
+  }
+
+  // Get the messages array for this task
+  const messages = activeTaskMessages.get(taskGenerator);
+  if (!messages) {
+    throw new Error(
+      'Task not found or already completed. Status can only be retrieved for active tasks.',
+    );
+  }
+
+  // Get task ID
+  const taskId = activeTaskIds.get(taskGenerator) || 'unknown';
+
+  // Get basic info
+  const totalMessages = messages.length;
+
+  // Get last message timestamp
+  let lastMessageTimestamp = Date.now(); // Default to now
+  if (messages.length > 0) {
+    const lastMessage = messages[messages.length - 1] as any;
+    // Try to get timestamp from message, or use current time
+    lastMessageTimestamp = lastMessage.timestamp || Date.now();
+  }
+
+  // Build context for the summary - just use recent messages
+  const RECENT_MESSAGE_COUNT = 20;
+  const recentMessages = messages.slice(-RECENT_MESSAGE_COUNT);
+
+  // Build simple context
+  const contextParts: string[] = [];
+  contextParts.push(`## Recent ${Math.min(recentMessages.length, RECENT_MESSAGE_COUNT)} Messages:`);
+  recentMessages.forEach((msg) => {
+    const msgObj = msg as any;
+    const truncatedContent = msgObj.content ?
+      (msgObj.content.length > 200 ?
+        msgObj.content.substring(0, 200) + '...' :
+        msgObj.content) : '';
+    contextParts.push(`${msgObj.role}: ${truncatedContent}`);
+  });
+
+  // Create a simple prompt for the summary model
+  const summaryPrompt = `You are an expert at summarizing task progress. Your job is to provide a concise summary of the current state of the task based on the recent messages.
+
+Please review the list of messages below which have been output from a currently running task and summarize the current state.
+
+WARNING: Do not make assumptions! Summarize only what is present in the messages.
+
+Total messages: ${totalMessages}
+Current timestamp: ${Date.now()}
+Last message timestamp: ${lastMessageTimestamp}
+
+${prompt}`;
+
+  // Use ensemble to generate the summary
+  const summaryMessages = [
+    {
+      type: 'message' as const,
+      role: 'developer' as const,
+      content: summaryPrompt,
+    },
+    {
+      type: 'message' as const,
+      role: 'user' as const,
+      content: contextParts.join('\n\n'),
+    }
+  ];
+
+  // Clone agent and set model class for summary
+  const summaryAgent = cloneAgent(agent);
+  summaryAgent.modelClass = 'summary' as any; // Cast to any to bypass type checking for now
+
+  // ensembleRequest returns an AsyncGenerator, we need to consume it
+  const responseGenerator = ensembleRequest(summaryMessages, summaryAgent);
+
+  // Extract the summary from the response
+  let summary = 'Unable to generate summary';
+
+  try {
+    // Consume the generator to get the response
+    for await (const event of responseGenerator) {
+      // When message is complete, extract the text from the message
+      if (event.type === 'message_complete') {
+        const completeEvent = event as any;
+        // The content is directly on the event, not nested in message
+        if (completeEvent.content) {
+          summary = completeEvent.content;
+        }
+        break; // Message is complete, we can stop
+      }
+    }
+  } catch (error) {
+    console.error('[TaskStatus] Error generating summary:', error);
+    // Keep default "Unable to generate summary" message
+  }
+
+  // Build the status event
+  const statusEvent: TaskStatusEvent = {
+    type: 'task_status',
+    task_id: taskId,
+    messageCount: totalMessages,
+    currentTimestamp: Date.now(),
+    lastMessageTimestamp: lastMessageTimestamp,
+    summary: summary,
+  };
+
+  return statusEvent;
 }

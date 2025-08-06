@@ -70,3 +70,15 @@ export interface MetaCognitionEvent {
     };
     timestamp: number;
 }
+
+/**
+ * Task status event for reporting the current state of a running task
+ */
+export interface TaskStatusEvent {
+    type: 'task_status';
+    task_id: string;
+    messageCount: number;
+    currentTimestamp: number;
+    lastMessageTimestamp: number;
+    summary: string;
+}

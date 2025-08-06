@@ -121,11 +121,11 @@ export class ThreadSummarizer {
 
 export class LLMSummarizer implements SummarizerInterface {
   private agent: Agent;
-  
+
   constructor(agent: Agent) {
     this.agent = agent;
   }
-  
+
   async summarize(
     thread: TopicThread,
     messagesToSummarize: number,
@@ -133,33 +133,33 @@ export class LLMSummarizer implements SummarizerInterface {
   ): Promise<string> {
     // Get the messages to summarize
     const messages = thread.messages.slice(0, messagesToSummarize);
-    
+
     if (messages.length === 0) {
       return '';
     }
-    
+
     // Format messages for the prompt
     const formattedMessages = this.formatMessages(messages);
-    
+
     // Get the appropriate prompt template
     const promptTemplate = SUMMARIZATION_PROMPTS[level.level];
-    
+
     // Build the prompt
     const prompt = promptTemplate
       .replace('{{topic_name}}', thread.name)
       .replace('{{messages}}', formattedMessages);
-    
+
     // Create a new agent for summarization based on the original
     const summarizerAgent = cloneAgent(this.agent);
     summarizerAgent.name = 'MetaMemory-Summarizer';
-    summarizerAgent.modelClass = 'standard'; // Use standard model for summarization
-    
+    summarizerAgent.modelClass = 'summary'; // Use summary model for summarization
+
     // Add JSON schema to the agent's model settings
     if (!summarizerAgent.modelSettings) {
       summarizerAgent.modelSettings = {};
     }
     summarizerAgent.modelSettings.json_schema = THREAD_SUMMARY_SCHEMA;
-    
+
     // Get the summary using ensembleRequest
     let responseContent = '';
     const requestMessages = [{
@@ -168,36 +168,36 @@ export class LLMSummarizer implements SummarizerInterface {
       content: prompt,
       id: `summarizer_${Date.now()}`
     }];
-    
+
     for await (const event of ensembleRequest(requestMessages, summarizerAgent)) {
       if (event.type === 'message_delta' && 'content' in event && event.content) {
         responseContent += event.content;
       }
     }
-    
+
     try {
       // Parse the JSON response
       const parsed = JSON.parse(responseContent);
-      
+
       // Build a formatted summary from the structured response
       let formattedSummary = parsed.summary || '';
-      
+
       if (parsed.key_points && parsed.key_points.length > 0) {
         formattedSummary += '\n\nKey Points:\n' + parsed.key_points.map((p: string) => `• ${p}`).join('\n');
       }
-      
+
       if (parsed.open_questions && parsed.open_questions.length > 0) {
         formattedSummary += '\n\nOpen Questions:\n' + parsed.open_questions.map((q: string) => `• ${q}`).join('\n');
       }
-      
+
       if (parsed.next_steps) {
         formattedSummary += '\n\nNext Steps: ' + parsed.next_steps;
       }
-      
+
       if (parsed.current_status) {
         formattedSummary += '\n\nCurrent Status: ' + parsed.current_status;
       }
-      
+
       // Clean and truncate the summary
       return this.cleanSummary(formattedSummary, level.maxTokens);
     } catch (error) {
@@ -207,7 +207,7 @@ export class LLMSummarizer implements SummarizerInterface {
       return this.cleanSummary(responseContent, level.maxTokens);
     }
   }
-  
+
   /**
    * Format messages for the summarization prompt
    */
@@ -219,23 +219,23 @@ export class LLMSummarizer implements SummarizerInterface {
       })
       .join('\n---\n\n');
   }
-  
+
   /**
    * Clean and truncate the summary to fit token limits
    */
   private cleanSummary(summary: string, maxTokens: number): string {
     // Remove any markdown formatting that might interfere
     let cleaned = summary.trim();
-    
+
     // Simple token estimation (4 chars per token)
     const estimatedTokens = Math.ceil(cleaned.length / 4);
-    
+
     if (estimatedTokens > maxTokens) {
       // Truncate to fit token limit
       const maxChars = maxTokens * 4;
       cleaned = cleaned.substring(0, maxChars - 20) + '\n[Summary truncated]';
     }
-    
+
     return cleaned;
   }
 }

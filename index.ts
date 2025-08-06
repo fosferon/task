@@ -20,6 +20,8 @@ export {
     resumeTask,
     // Add messages to an active task
     addMessageToTask,
+    // Get status of an active task
+    taskStatus,
 } from './src/core/engine.js';
 
 // ============================================================================
@@ -36,7 +38,8 @@ export type {
     TaskFatalErrorEvent,
     TaskEvent,
     MetaMemoryEvent,
-    MetaCognitionEvent
+    MetaCognitionEvent,
+    TaskStatusEvent
 } from './src/types/events.js';
 
 // Export TaskLocalState and CognitionState types
