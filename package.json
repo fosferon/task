@@ -70,12 +70,12 @@
     "ci:all": "./scripts/update-with-options.sh --ci"
   },
   "dependencies": {
-    "@just-every/ensemble": "^0.2.153",
+    "@just-every/ensemble": "^0.2.154",
     "uuid": "^11.1.0"
   },
   "peerDependencies": {
     "anthropic": ">=0.20.0",
-    "openai": "^5.7.0"
+    "openai": "^5.12.1"
   },
   "peerDependenciesMeta": {
     "openai": {
@@ -87,14 +87,14 @@
   },
   "devDependencies": {
     "@types/express": "^5.0.3",
-    "@types/node": "^24.0.3",
+    "@types/node": "^24.2.0",
     "@types/ws": "^8.18.1",
     "@vitest/coverage-v8": "^3.2.4",
-    "dotenv": "^17.0.1",
+    "dotenv": "^17.2.1",
     "express": "^5.1.0",
     "tsx": "^4.20.3",
-    "typescript": "^5.8.3",
-    "vitest": "^3.2.3",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4",
     "ws": "^8.18.3"
   },
   "exports": {
