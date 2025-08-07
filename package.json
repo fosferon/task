@@ -70,7 +70,7 @@
     "ci:all": "./scripts/update-with-options.sh --ci"
   },
   "dependencies": {
-    "@just-every/ensemble": "^0.2.154",
+    "@just-every/ensemble": "^0.2.155",
     "uuid": "^11.1.0"
   },
   "peerDependencies": {
