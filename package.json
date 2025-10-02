@@ -1,6 +1,6 @@
 {
   "name": "@just-every/task",
-  "version": "0.2.43",
+  "version": "0.2.43-patched.1",
   "description": "Task - Thoughtful Task Loop",
   "main": "./dist/index.js",
   "module": "./dist/index.js",
@@ -101,6 +101,10 @@
     ".": {
       "import": "./dist/index.js",
       "types": "./dist/index.d.ts"
+    },
+    "./dist/src/core/thought_utils.js": {
+      "import": "./dist/src/core/thought_utils.js",
+      "types": "./dist/src/core/thought_utils.d.ts"
     }
   },
   "files": [
